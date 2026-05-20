@@ -11,22 +11,32 @@
 [rust-badge]: https://img.shields.io/badge/rust-edition%202024-orange.svg
 [rust-url]: https://doc.rust-lang.org/edition-guide/
 
-**Lightweight SOTA local search engine for AI agents in Rust — BM25 full-text search, vector semantic search, hybrid search with query expansion and reranking, plus an MCP server for AI tool integration.**
+**Lightweight local BM25 search engine for Markdown files in Rust.**
+
+qmd indexes Markdown collections into a single SQLite database and searches them
+with SQLite FTS5/BM25. It is intentionally dependency-light: no embedding model,
+no ONNX runtime, and no vector database.
+
+## Features
+
+- Register one or more Markdown collections.
+- Incrementally index changed files by content hash.
+- Search with BM25 full-text ranking.
+- Retrieve documents by `collection/path.md` or short document id.
+- Store optional global and path-scoped context notes for collections.
+- Use as a Codex skill backend through [`skills/qmd-search`](skills/qmd-search/).
 
 ## Crates
 
 | Crate | | Description |
 | --- | --- | --- |
-| **[`qmd`](qmd/)** | [![crates.io][qmd-crate]][qmd-crate-url] [![docs.rs][qmd-doc]][qmd-doc-url] | Core library — indexing, BM25, vector search, hybrid search, embeddings |
-| **[`qmd-cli`](qmd-cli/)** | [![crates.io][cli-crate]][cli-crate-url] | CLI tool — collection management, search, RAG question answering |
-| **[`qmd-mcp`](qmd-mcp/)** | [![crates.io][mcp-crate]][mcp-crate-url] | MCP server — expose qmd as an AI agent tool |
+| **[`qmd`](qmd/)** | [![crates.io][qmd-crate]][qmd-crate-url] [![docs.rs][qmd-doc]][qmd-doc-url] | Core library — indexing and BM25 full-text search |
+| **[`qmd-cli`](qmd-cli/)** | [![crates.io][cli-crate]][cli-crate-url] | CLI tool — collection management and search |
 
 [qmd-crate]: https://img.shields.io/crates/v/qmd.svg
 [qmd-crate-url]: https://crates.io/crates/qmd
 [cli-crate]: https://img.shields.io/crates/v/qmd-cli.svg
 [cli-crate-url]: https://crates.io/crates/qmd-cli
-[mcp-crate]: https://img.shields.io/crates/v/qmd-mcp.svg
-[mcp-crate-url]: https://crates.io/crates/qmd-mcp
 [qmd-doc]: https://img.shields.io/docsrs/qmd.svg
 [qmd-doc-url]: https://docs.rs/qmd
 
@@ -56,30 +66,48 @@ cargo install qmd-cli
 
 ```bash
 # Add a collection of markdown files
-qmd collection add ./docs --name my-docs --mask "**/*.md"
+qmd --index .qmd/index.sqlite collection add ./docs --name my-docs --pattern "**/*.md"
 
 # List collections
-qmd ls
+qmd --index .qmd/index.sqlite collection list
 
 # BM25 full-text search
-qmd search "query expansion" -n 5
-
-# Vector semantic search (requires embedding model)
-qmd models pull          # download default models
-qmd embed                # generate embeddings
-qmd vsearch "how does reranking work" -n 5
-
-# Hybrid search (BM25 + vector + query expansion + reranking)
-qmd qsearch "local search engine for AI"
-
-# Ask a question (RAG)
-qmd ask "What search algorithms does qmd support?"
+qmd --index .qmd/index.sqlite search "query expansion" -n 5
 
 # Get a specific document
-qmd get qmd://my-docs/README.md
+qmd --index .qmd/index.sqlite get my-docs/README.md
 
 # Re-index all collections
-qmd update
+qmd --index .qmd/index.sqlite update
+```
+
+### Codex Skill
+
+This repository includes a local Codex skill at
+[`skills/qmd-search`](skills/qmd-search/). The skill teaches an agent how to use
+qmd as a BM25 search backend for local Markdown knowledge bases.
+
+Example:
+
+```bash
+bash skills/qmd-search/scripts/qmd_search.sh \
+  --index .qmd/index.sqlite \
+  --root ./docs \
+  --collection docs \
+  --query "authentication token" \
+  --limit 5
+```
+
+The script registers the collection, updates the index, and prints JSON search
+results. It uses an installed `qmd` binary when available, otherwise it falls
+back to this repository's `qmd-cli` via Cargo.
+
+## Development
+
+```bash
+cargo check --workspace --all-targets
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## License

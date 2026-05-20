@@ -1,4 +1,4 @@
-//! Top-level facade: [`Qmd`] owns the database and ML engines.
+//! Top-level facade: [`Qmd`] owns the search database.
 //!
 //! ```rust,no_run
 //! use qmd::{Qmd, Collection};
@@ -6,47 +6,34 @@
 //! let mut qmd = Qmd::open("./index.sqlite")?;
 //! qmd.register_collection(&Collection::new("docs", "/path/to/docs"))?;
 //! qmd.update(None)?;
-//! qmd.embed()?;
 //! let results = qmd.search("how does auth work?", 10)?;
 //! # Ok::<(), qmd::Error>(())
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 
 use ignore::WalkBuilder;
 
-use crate::chunk::Chunker;
 use crate::db::{
     Collection, CollectionInfo, Db, Document, IndexStatus, SearchResult, extract_title,
     hash_content,
 };
-use crate::embed::Embedder;
 use crate::error::{Error, Result};
-use crate::rerank::Reranker;
-use crate::search::{self, Query, QueryType};
+use crate::search;
 
 /// The main qmd handle.
 ///
-/// Owns the SQLite database, embedding model, and reranker — all lazily
-/// initialized on first use.
+/// Owns the SQLite database and exposes collection, indexing, and BM25 search
+/// operations.
 pub struct Qmd {
     /// SQLite database handle.
     db: Db,
-    /// Lazily-loaded embedding engine.
-    embedder: Option<Embedder>,
-    /// Lazily-loaded reranking engine.
-    reranker: Option<Reranker>,
-    /// Document chunker for embedding.
-    chunker: Chunker,
 }
 
 impl std::fmt::Debug for Qmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Qmd")
-            .field("embedder_loaded", &self.embedder.is_some())
-            .field("reranker_loaded", &self.reranker.is_some())
-            .finish_non_exhaustive()
+        f.debug_struct("Qmd").finish_non_exhaustive()
     }
 }
 
@@ -55,9 +42,6 @@ impl Qmd {
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             db: Db::open(db_path.as_ref())?,
-            embedder: None,
-            reranker: None,
-            chunker: Chunker::default(),
         })
     }
 
@@ -65,9 +49,6 @@ impl Qmd {
     pub fn open_memory() -> Result<Self> {
         Ok(Self {
             db: Db::open_memory()?,
-            embedder: None,
-            reranker: None,
-            chunker: Chunker::default(),
         })
     }
 
@@ -75,19 +56,6 @@ impl Qmd {
     #[must_use]
     pub const fn db(&self) -> &Db {
         &self.db
-    }
-
-    /// Set a custom chunker.
-    pub const fn set_chunker(&mut self, chunker: Chunker) {
-        self.chunker = chunker;
-    }
-
-    /// Ensure the embedder is loaded, lazily initializing on first call.
-    fn ensure_embedder(&mut self) -> Result<()> {
-        if self.embedder.is_none() {
-            self.embedder = Some(Embedder::new()?);
-        }
-        Ok(())
     }
 
     // ── Collection management ───────────────────────────────────────────
@@ -243,185 +211,17 @@ impl Qmd {
         })
     }
 
-    // ── Embedding ───────────────────────────────────────────────────────
-
-    /// Generate embeddings for all documents that need them.
-    pub fn embed(&mut self) -> Result<EmbedResult> {
-        let docs = self.db.unembedded_docs()?;
-        if docs.is_empty() {
-            return Ok(EmbedResult {
-                embedded: 0,
-                chunks: 0,
-            });
-        }
-
-        self.ensure_embedder()?;
-
-        let mut total_chunks = 0usize;
-        for (hash, _path, body) in &docs {
-            let chunks = self.chunker.split(body);
-            let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-
-            let embedder = self.embedder.as_mut().unwrap_or_else(|| unreachable!());
-            let embeddings = embedder.embed_documents(&texts)?;
-
-            for (seq, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
-                self.db
-                    .insert_embedding(hash, seq, chunk.pos, emb, "default")?;
-            }
-            total_chunks += chunks.len();
-        }
-
-        Ok(EmbedResult {
-            embedded: docs.len(),
-            chunks: total_chunks,
-        })
-    }
-
     // ── Search ──────────────────────────────────────────────────────────
 
-    /// Full-text search (BM25 only, no ML).
+    /// Full-text search using BM25.
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         let fts_query = search::build_fts5_query(query).unwrap_or_else(|| query.to_string());
         self.db.search_fts(&fts_query, limit, None)
     }
 
-    /// Vector similarity search.
-    pub fn search_vec(&mut self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        self.ensure_embedder()?;
-        let embedder = self.embedder.as_mut().unwrap_or_else(|| unreachable!());
-        let emb = embedder.embed_query(query)?;
-        self.db.search_vec(&emb, limit, None)
-    }
-
-    /// Hybrid search: FTS + vector + RRF fusion + optional reranking.
-    ///
-    /// This is the recommended search method for best quality.
-    pub fn search(&mut self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        let queries = Query::expand_simple(query);
-        self.search_with_queries(query, &queries, limit)
-    }
-
-    /// Search with pre-expanded queries (for external LLM integration).
-    pub fn search_with_queries(
-        &mut self,
-        query: &str,
-        queries: &[Query],
-        limit: usize,
-    ) -> Result<Vec<SearchResult>> {
-        let fetch_limit = limit * 3;
-
-        let mut all_lists: Vec<Vec<String>> = Vec::new();
-        let mut all_weights: Vec<f64> = Vec::new();
-        let mut result_map: HashMap<String, SearchResult> = HashMap::new();
-
-        if let Some(fts_q) = search::build_fts5_query(query)
-            && let Ok(hits) = self.db.search_fts(&fts_q, fetch_limit, None)
-        {
-            collect_results(&mut all_lists, &mut all_weights, &mut result_map, hits, 1.0);
-        }
-
-        self.ensure_embedder()?;
-
-        for q in queries {
-            match q.kind {
-                QueryType::Lex => {
-                    if let Some(fts_q) = search::build_fts5_query(&q.text)
-                        && let Ok(hits) = self.db.search_fts(&fts_q, fetch_limit, None)
-                    {
-                        collect_results(
-                            &mut all_lists,
-                            &mut all_weights,
-                            &mut result_map,
-                            hits,
-                            0.8,
-                        );
-                    }
-                }
-                QueryType::Vec | QueryType::Hyde => {
-                    let embedder = self.embedder.as_mut().unwrap_or_else(|| unreachable!());
-                    if let Ok(emb) = embedder.embed_query(&q.text)
-                        && let Ok(hits) = self.db.search_vec(&emb, fetch_limit, None)
-                    {
-                        collect_results(
-                            &mut all_lists,
-                            &mut all_weights,
-                            &mut result_map,
-                            hits,
-                            1.0,
-                        );
-                    }
-                }
-            }
-        }
-
-        let list_refs: Vec<&[String]> = all_lists.iter().map(Vec::as_slice).collect();
-        let fused = search::rrf(&list_refs, Some(&all_weights), 60);
-
-        let mut results: Vec<SearchResult> = fused
-            .iter()
-            .filter_map(|hit| {
-                result_map.remove(&hit.key).map(|mut r| {
-                    r.score = hit.score;
-                    r
-                })
-            })
-            .collect();
-
-        if results.len() > 1 {
-            self.apply_reranking(query, &mut results, limit);
-        }
-
-        results.truncate(limit);
-        Ok(results)
-    }
-
-    /// Apply cross-encoder reranking to top results.
-    fn apply_reranking(&mut self, query: &str, results: &mut Vec<SearchResult>, limit: usize) {
-        if self.reranker.is_none() {
-            match Reranker::new() {
-                Ok(r) => self.reranker = Some(r),
-                Err(_) => return,
-            }
-        }
-
-        let top_n = results.len().min(limit * 2);
-        let snippets: Vec<String> = results[..top_n]
-            .iter()
-            .filter_map(|r| {
-                self.db
-                    .get_body(&r.doc.hash)
-                    .ok()?
-                    .map(|body| search::extract_snippet(&body, query, 4000))
-            })
-            .collect();
-
-        if snippets.is_empty() {
-            return;
-        }
-
-        let doc_refs: Vec<&str> = snippets.iter().map(String::as_str).collect();
-        let reranker = self.reranker.as_mut().unwrap_or_else(|| unreachable!());
-        let Ok(scored) = reranker.rerank(query, &doc_refs, top_n) else {
-            return;
-        };
-
-        let mut reranked: Vec<SearchResult> = Vec::with_capacity(scored.len());
-        let mut used: HashSet<usize> = HashSet::new();
-        for s in &scored {
-            if s.index < results.len() {
-                let mut r = results[s.index].clone();
-                r.score = f64::from(s.score);
-                reranked.push(r);
-                used.insert(s.index);
-            }
-        }
-        for (i, r) in results.iter().enumerate() {
-            if !used.contains(&i) {
-                reranked.push(r.clone());
-            }
-        }
-        *results = reranked;
+    /// Search documents using BM25 full-text search.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        self.search_fts(query, limit)
     }
 
     // ── Document retrieval ──────────────────────────────────────────────
@@ -457,21 +257,11 @@ impl Qmd {
         self.db.doc_count()
     }
 
-    /// Count documents needing embedding.
-    pub fn needs_embedding(&self) -> Result<usize> {
-        self.db.needs_embedding_count()
-    }
-
     // ── Maintenance ─────────────────────────────────────────────────────
 
     /// Delete inactive documents and orphaned data.
     pub fn cleanup(&self) -> Result<usize> {
         self.db.cleanup()
-    }
-
-    /// Clear all embeddings (forces re-embedding).
-    pub fn clear_embeddings(&mut self) -> Result<usize> {
-        self.db.clear_embeddings()
     }
 
     /// Vacuum the database.
@@ -524,24 +314,6 @@ fn walk_collection(
     Ok(files)
 }
 
-/// Collect search results into shared lists for RRF fusion.
-fn collect_results(
-    lists: &mut Vec<Vec<String>>,
-    weights: &mut Vec<f64>,
-    map: &mut HashMap<String, SearchResult>,
-    results: Vec<SearchResult>,
-    weight: f64,
-) {
-    let keys: Vec<String> = results.iter().map(|r| r.doc.display_path()).collect();
-    for r in results {
-        map.entry(r.doc.display_path()).or_insert(r);
-    }
-    if !keys.is_empty() {
-        lists.push(keys);
-        weights.push(weight);
-    }
-}
-
 /// Result of an [`update`](Qmd::update) operation across collections.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
@@ -570,16 +342,6 @@ pub struct IndexResult {
     pub unchanged: usize,
     /// Removed (deactivated) documents.
     pub removed: usize,
-}
-
-/// Result of an embedding operation.
-#[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
-pub struct EmbedResult {
-    /// Documents embedded.
-    pub embedded: usize,
-    /// Total chunks processed.
-    pub chunks: usize,
 }
 
 /// Directories excluded from indexing.

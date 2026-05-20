@@ -1,7 +1,6 @@
 //! QMD — Query Markdown Documents.
 //!
-//! Local search engine for markdown files combining FTS5 (BM25),
-//! sqlite-vec (vector KNN), and fastembed (ONNX embeddings + reranking).
+//! Local search engine for markdown files backed by SQLite FTS5 (BM25).
 //!
 //! # Quick start
 //!
@@ -11,9 +10,8 @@
 //! let mut qmd = Qmd::open("./index.sqlite")?;
 //! qmd.register_collection(&Collection::new("docs", "/path/to/docs"))?;
 //! qmd.update(None)?;
-//! qmd.embed()?;
 //!
-//! // Hybrid search (FTS + vector + RRF + rerank)
+//! // BM25 full-text search
 //! let results = qmd.search("how does auth work?", 10)?;
 //!
 //! // Or just BM25
@@ -21,17 +19,13 @@
 //! # Ok::<(), qmd::Error>(())
 //! ```
 
-pub mod chunk;
 pub mod db;
-pub mod embed;
 pub mod error;
 pub mod qmd;
-pub mod rerank;
 pub mod search;
 
 pub use db::{
     Collection, CollectionInfo, Document, IndexStatus, SearchResult, SearchSource, hash_content,
 };
 pub use error::{Error, Result};
-pub use qmd::{EmbedResult, IndexResult, Qmd, UpdateResult};
-pub use search::{Query, QueryType};
+pub use qmd::{IndexResult, Qmd, UpdateResult};

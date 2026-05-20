@@ -1,7 +1,7 @@
 //! SQLite database: schema, connection, and core operations.
 //!
-//! Integrates `sqlite-vec` for native KNN vector search and FTS5 for
-//! full-text search, all within a single `.sqlite` file.
+//! Integrates SQLite FTS5 for full-text BM25 search within a single
+//! `.sqlite` file.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -15,7 +15,6 @@ use std::time::SystemTime;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use zerocopy::IntoBytes;
 
 use crate::error::{Error, Result};
 
@@ -188,8 +187,6 @@ pub struct SearchResult {
 pub enum SearchSource {
     /// Full-text search (BM25).
     Fts,
-    /// Vector similarity search.
-    Vec,
 }
 
 /// Index health and status information.
@@ -198,10 +195,6 @@ pub enum SearchSource {
 pub struct IndexStatus {
     /// Total active documents.
     pub total_documents: usize,
-    /// Documents needing embedding.
-    pub needs_embedding: usize,
-    /// Whether a vector index exists.
-    pub has_vector_index: bool,
     /// Per-collection info.
     pub collections: Vec<CollectionInfo>,
 }
@@ -211,8 +204,6 @@ pub struct IndexStatus {
 pub struct Db {
     /// SQLite connection handle.
     pub(crate) conn: Connection,
-    /// Embedding dimensionality (set after first embedding insert).
-    dims: Option<usize>,
 }
 
 impl Db {
@@ -221,30 +212,20 @@ impl Db {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Self::init_connection(Connection::open(path)?)?;
-        let db = Self { conn, dims: None };
+        let db = Self {
+            conn: Connection::open(path)?,
+        };
         db.migrate()?;
         Ok(db)
     }
 
     /// Open an in-memory database (useful for tests).
     pub fn open_memory() -> Result<Self> {
-        let conn = Self::init_connection(Connection::open_in_memory()?)?;
-        let db = Self { conn, dims: None };
+        let db = Self {
+            conn: Connection::open_in_memory()?,
+        };
         db.migrate()?;
         Ok(db)
-    }
-
-    /// Register sqlite-vec extension and return the connection.
-    #[allow(clippy::unnecessary_wraps)]
-    fn init_connection(conn: Connection) -> Result<Connection> {
-        #[allow(unsafe_code, clippy::missing_transmute_annotations)]
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
-        Ok(conn)
     }
 
     /// Run schema migrations.
@@ -280,15 +261,6 @@ impl Db {
             CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
                 filepath, title, body,
                 tokenize='porter unicode61'
-            );
-
-            CREATE TABLE IF NOT EXISTS content_vectors (
-                hash        TEXT NOT NULL,
-                seq         INTEGER NOT NULL DEFAULT 0,
-                pos         INTEGER NOT NULL DEFAULT 0,
-                model       TEXT NOT NULL,
-                embedded_at TEXT NOT NULL,
-                PRIMARY KEY (hash, seq)
             );
 
             CREATE TABLE IF NOT EXISTS store_collections (
@@ -349,25 +321,6 @@ impl Db {
                 END;
                 ",
             )?;
-        }
-        Ok(())
-    }
-
-    /// Create the sqlite-vec virtual table for the given dimensionality.
-    fn ensure_vec_table(&self, dims: usize) -> Result<()> {
-        let exists: bool = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_embeddings'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if !exists {
-            self.conn.execute_batch(&format!(
-                "CREATE VIRTUAL TABLE vec_embeddings USING vec0(embedding float[{dims}]);"
-            ))?;
         }
         Ok(())
     }
@@ -766,142 +719,6 @@ impl Db {
         Ok(results)
     }
 
-    // ── Embedding / Vector ──────────────────────────────────────────────
-
-    /// Insert an embedding vector using sqlite-vec.
-    ///
-    /// The `rowid` in `vec_embeddings` is a sequential integer. We store a
-    /// mapping in `content_vectors` from `(hash, seq)` → `rowid`.
-    pub fn insert_embedding(
-        &mut self,
-        hash: &str,
-        seq: usize,
-        pos: usize,
-        embedding: &[f32],
-        model: &str,
-    ) -> Result<()> {
-        if self.dims.is_none() {
-            self.dims = Some(embedding.len());
-            self.ensure_vec_table(embedding.len())?;
-        }
-
-        let now = now_rfc3339();
-
-        let existing_rowid: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT rowid FROM content_vectors WHERE hash = ?1 AND seq = ?2",
-                params![hash, seq as i64],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        let vec_bytes = embedding.as_bytes();
-
-        if let Some(rid) = existing_rowid {
-            self.conn.execute(
-                "UPDATE vec_embeddings SET embedding = ?1 WHERE rowid = ?2",
-                params![vec_bytes, rid],
-            )?;
-            self.conn.execute(
-                "UPDATE content_vectors SET pos = ?1, model = ?2, embedded_at = ?3 WHERE hash = ?4 AND seq = ?5",
-                params![pos as i64, model, now, hash, seq as i64],
-            )?;
-        } else {
-            self.conn.execute(
-                "INSERT INTO vec_embeddings (embedding) VALUES (?1)",
-                params![vec_bytes],
-            )?;
-            let rowid = self.conn.last_insert_rowid();
-            self.conn.execute(
-                r"INSERT INTO content_vectors (rowid, hash, seq, pos, model, embedded_at)
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![rowid, hash, seq as i64, pos as i64, model, now],
-            )?;
-        }
-
-        Ok(())
-    }
-
-    /// Documents that need embedding.
-    pub fn unembedded_docs(&self) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self.conn.prepare(
-            r"SELECT DISTINCT d.hash, d.path, c.doc
-              FROM documents d
-              JOIN content c ON c.hash = d.hash
-              LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-              WHERE d.active = 1 AND v.hash IS NULL",
-        )?;
-        let results = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(results)
-    }
-
-    /// Vector similarity search using sqlite-vec native KNN.
-    pub fn search_vec(
-        &self,
-        query_embedding: &[f32],
-        limit: usize,
-        collection: Option<&str>,
-    ) -> Result<Vec<SearchResult>> {
-        if self.dims.is_none() {
-            return Ok(Vec::new());
-        }
-
-        let vec_bytes = query_embedding.as_bytes();
-
-        let coll_filter = if collection.is_some() {
-            "AND d.collection = ?3"
-        } else {
-            ""
-        };
-
-        let sql = format!(
-            r"SELECT d.collection, d.path, d.title, d.hash, d.modified_at,
-                     LENGTH(c.doc), ve.distance
-              FROM vec_embeddings ve
-              JOIN content_vectors cv ON cv.rowid = ve.rowid
-              JOIN documents d ON d.hash = cv.hash AND d.active = 1
-              JOIN content c ON c.hash = d.hash
-              WHERE ve.embedding MATCH ?1
-                AND k = ?2
-                {coll_filter}
-              ORDER BY ve.distance"
-        );
-
-        let mut stmt = self.conn.prepare(&sql)?;
-
-        let map_row = |row: &rusqlite::Row<'_>| {
-            let body_len: i64 = row.get(5)?;
-            let distance: f64 = row.get(6)?;
-            let similarity = 1.0 - distance;
-            Ok(SearchResult {
-                doc: Document {
-                    collection: row.get(0)?,
-                    path: row.get(1)?,
-                    title: row.get(2)?,
-                    hash: row.get(3)?,
-                    modified_at: row.get(4)?,
-                    body_len: body_len as usize,
-                    body: None,
-                },
-                score: similarity,
-                source: SearchSource::Vec,
-            })
-        };
-
-        let results: Vec<SearchResult> = if let Some(coll) = collection {
-            stmt.query_map(params![vec_bytes, limit as i64, coll], map_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        } else {
-            stmt.query_map(params![vec_bytes, limit as i64], map_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-
-        Ok(results)
-    }
-
     // ── Index health ────────────────────────────────────────────────────
 
     /// Count active documents.
@@ -913,30 +730,9 @@ impl Db {
         )?)
     }
 
-    /// Count documents needing embedding.
-    pub fn needs_embedding_count(&self) -> Result<usize> {
-        Ok(self.conn.query_row(
-            r"SELECT COUNT(DISTINCT d.hash)
-              FROM documents d
-              LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-              WHERE d.active = 1 AND v.hash IS NULL",
-            [],
-            |row| row.get::<_, i64>(0).map(|v| v as usize),
-        )?)
-    }
-
     /// Get full index status.
     pub fn status(&self) -> Result<IndexStatus> {
         let total = self.doc_count()?;
-        let needs = self.needs_embedding_count()?;
-        let has_vec: bool = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_embeddings'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
 
         let collections = self.list_collections()?;
         let mut infos = Vec::with_capacity(collections.len());
@@ -960,15 +756,13 @@ impl Db {
 
         Ok(IndexStatus {
             total_documents: total,
-            needs_embedding: needs,
-            has_vector_index: has_vec,
             collections: infos,
         })
     }
 
     // ── Maintenance ─────────────────────────────────────────────────────
 
-    /// Delete inactive documents and orphaned content/vectors.
+    /// Delete inactive documents and orphaned content.
     pub fn cleanup(&self) -> Result<usize> {
         let c1 = self
             .conn
@@ -977,32 +771,7 @@ impl Db {
             "DELETE FROM content WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
             [],
         )?;
-        let orphans: Vec<i64> = {
-            let mut stmt = self.conn.prepare(
-                r"SELECT cv.rowid FROM content_vectors cv
-                  WHERE cv.hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
-            )?;
-            stmt.query_map([], |row| row.get(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        for rid in &orphans {
-            let _ = self
-                .conn
-                .execute("DELETE FROM vec_embeddings WHERE rowid = ?1", params![rid]);
-        }
-        let c3 = self.conn.execute(
-            "DELETE FROM content_vectors WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
-            [],
-        )?;
-        Ok(c1 + c2 + c3)
-    }
-
-    /// Clear all embeddings.
-    pub fn clear_embeddings(&mut self) -> Result<usize> {
-        let c = self.conn.execute("DELETE FROM content_vectors", [])?;
-        let _ = self.conn.execute("DROP TABLE IF EXISTS vec_embeddings", []);
-        self.dims = None;
-        Ok(c)
+        Ok(c1 + c2)
     }
 
     /// Vacuum the database.
@@ -1274,7 +1043,6 @@ mod tests {
 
         let s = db.status().unwrap();
         assert_eq!(s.total_documents, 1);
-        assert_eq!(s.needs_embedding, 1);
         assert_eq!(s.collections.len(), 1);
         assert_eq!(s.collections[0].doc_count, 1);
     }
@@ -1296,16 +1064,5 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].doc.title, "Rust Ownership");
         assert_eq!(results[0].source, SearchSource::Fts);
-    }
-
-    #[test]
-    fn test_needs_embedding_count() {
-        let db = mem_db();
-
-        let h = hash_content("some text");
-        db.insert_content(&h, "some text").unwrap();
-        db.upsert_document("c", "f.md", "F", &h).unwrap();
-
-        assert_eq!(db.needs_embedding_count().unwrap(), 1);
     }
 }

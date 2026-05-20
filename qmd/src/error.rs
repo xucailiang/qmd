@@ -18,18 +18,6 @@ pub enum Error {
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// YAML serialization error.
-    #[error("yaml: {0}")]
-    Yaml(#[from] serde_yml::Error),
-
-    /// Embedding model error.
-    #[error("embedding: {0}")]
-    Embedding(String),
-
-    /// Reranking model error.
-    #[error("rerank: {0}")]
-    Rerank(String),
-
     /// Configuration or path resolution error.
     #[error("config: {0}")]
     Config(String),

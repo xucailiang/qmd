@@ -38,13 +38,7 @@ enum Command {
         #[arg(short, long)]
         collection: Vec<String>,
     },
-    /// Generate vector embeddings for unembedded documents.
-    Embed {
-        /// Clear all embeddings first.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Hybrid search (FTS + vector + RRF + rerank).
+    /// BM25 full-text search.
     Search {
         /// Search query.
         query: String,
@@ -173,7 +167,6 @@ fn run(cli: Cli) -> qmd::Result<()> {
     match cli.command {
         Command::Collection { action } => cmd_collection(&cli.index, action),
         Command::Update { collection } => cmd_update(&cli.index, &collection),
-        Command::Embed { force } => cmd_embed(&cli.index, force),
         Command::Search { query, limit, json } => cmd_search(&cli.index, &query, limit, json),
         Command::Fts { query, limit, json } => cmd_fts(&cli.index, &query, limit, json),
         Command::Get { path, json } => cmd_get(&cli.index, &path, json),
@@ -240,19 +233,8 @@ fn cmd_update(index: &PathBuf, collections: &[String]) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_embed(index: &PathBuf, force: bool) -> qmd::Result<()> {
-    let mut qmd = Qmd::open(index)?;
-    if force {
-        qmd.clear_embeddings()?;
-        println!("cleared all embeddings");
-    }
-    let r = qmd.embed()?;
-    println!("{} documents embedded, {} chunks", r.embedded, r.chunks);
-    Ok(())
-}
-
 fn cmd_search(index: &PathBuf, query: &str, limit: usize, json: bool) -> qmd::Result<()> {
-    let mut qmd = Qmd::open(index)?;
+    let qmd = Qmd::open(index)?;
     let results = qmd.search(query, limit)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&results)?);
@@ -314,11 +296,6 @@ fn cmd_status(index: &PathBuf, json: bool) -> qmd::Result<()> {
         println!("{}", serde_json::to_string_pretty(&s)?);
     } else {
         println!("documents:        {}", s.total_documents);
-        println!("needs embedding:  {}", s.needs_embedding);
-        println!(
-            "vector index:     {}",
-            if s.has_vector_index { "yes" } else { "no" }
-        );
         if !s.collections.is_empty() {
             println!("\ncollections:");
             for c in &s.collections {
